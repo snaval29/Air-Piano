@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Air Piano</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0e0e0e;color:#888;font-family:'Inter',sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:.8rem 0}
+h1{font-size:.9rem;font-weight:500;color:#ccc;letter-spacing:.1em;text-transform:uppercase;text-align:center}
+.sub{font-size:.58rem;color:#444;margin:.15rem 0 .8rem;text-align:center}
+.wrap{width:100%;max-width:1100px;padding:0 .8rem;display:flex;flex-direction:column;gap:.5rem}
+.controls{display:flex;justify-content:center;gap:.6rem;flex-wrap:wrap;align-items:center}
+.tg{display:flex;border:1px solid #1e1e1e;border-radius:5px;overflow:hidden;background:#111}
+.tb{font-family:'Inter',sans-serif;font-size:.6rem;padding:5px 11px;border:none;background:transparent;color:#4a4a4a;cursor:pointer}
+.tb:not(:last-child){border-right:1px solid #1e1e1e}
+.tb.on{background:#1c1c1c;color:#bbb}
+.camwrap{position:relative;width:100%;border-radius:8px;overflow:hidden;background:#080808}
+#video{width:100%;display:block;transform:scaleX(-1)}
+#ov{position:absolute;inset:0;pointer-events:none}
+.badge{position:absolute;top:7px;left:9px;font-size:.48rem;color:#444;display:flex;align-items:center;gap:4px;text-transform:uppercase;letter-spacing:.05em}
+.dot{width:4px;height:4px;border-radius:50%;background:#2a2a2a;transition:background .3s}
+.dot.on{background:#4ade80}
+.splash{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.92);gap:.7rem;z-index:9}
+.splash p{font-size:.65rem;color:#4a4a4a;max-width:240px;text-align:center;line-height:1.65}
+.sbtn{font-family:'Inter',sans-serif;font-size:.65rem;padding:7px 18px;border-radius:5px;border:1px solid #252525;background:#141414;color:#999;cursor:pointer}
+.sbtn:hover{background:#1c1c1c;color:#ccc}
+.notebar{display:flex;gap:3px;justify-content:center;min-height:20px;align-items:center;flex-wrap:wrap}
+.ntag{font-size:.58rem;font-weight:500;padding:2px 7px;border-radius:3px;background:#161616;color:#777;border:1px solid #222;animation:nf .08s ease}
+@keyframes nf{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:translateY(0)}}
+#pc{width:100%;display:block;border-radius:6px;cursor:pointer}
+.stats{display:flex;justify-content:center;gap:1.2rem;font-size:.5rem;color:#383838}
+.stats b{color:#666;font-weight:500}
+#dbg{font-size:.5rem;color:#555;text-align:center;font-family:monospace;min-height:14px;letter-spacing:.02em}
+</style>
+</head>
+<body>
+<h1>Air Piano</h1>
+<p class="sub">lower fingertip past the <span style="color:#ffcc28">amber line</span> to play · raise above dashed line to re-arm</p>
+<div class="wrap">
+  <div class="controls">
+    <div class="tg" id="ssel">
+      <button class="tb on" data-s="chromatic">All</button>
+      <button class="tb" data-s="major">Major</button>
+      <button class="tb" data-s="minor">Minor</button>
+      <button class="tb" data-s="blues">Blues</button>
+      <button class="tb" data-s="penta">Penta</button>
+    </div>
+  </div>
+  <div class="notebar" id="nb"></div>
+  <div class="camwrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="ov"></canvas>
+    <div class="badge"><span class="dot" id="dot"></span><span id="stxt">offline</span></div>
+    <div class="splash" id="splash">
+      <p>Lower any fingertip past the amber line to play. Raise it back up to play again.</p>
+      <button class="sbtn" id="sbtn">Enable Camera</button>
+    </div>
+  </div>
+  <canvas id="pc"></canvas>
+  <div id="dbg">waiting for hands…</div>
+  <div class="stats">
+    <div>notes <b id="nc">0</b></div>
+    <div>hands <b id="hc">0</b></div>
+    <div>fingers below line <b id="fc">0</b></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script>
+'use strict';
+
+// ═══════════════════════════════
+// AUDIO
+// ═══════════════════════════════
+let ACX = null, masterOut, compressor;
+
+function bootAudio() {
+  if (ACX) return;
+  ACX = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  compressor = ACX.createDynamicsCompressor();
+  compressor.threshold.value = -10;
+  compressor.knee.value = 8;
+  compressor.ratio.value = 4;
+  compressor.attack.value = 0.001;
+  compressor.release.value = 0.1;
+  compressor.connect(ACX.destination);
+  
+  masterOut = ACX.createGain();
+  masterOut.gain.value = 0.7; // Lowered slightly to prevent clipping
+  masterOut.connect(compressor);
+
+  // Build reverb IR once
+  const SR = ACX.sampleRate, len = Math.floor(SR * 1.2);
+  const ir = ACX.createBuffer(2, len, SR);
+  for (let c = 0; c < 2; c++) {
+    const d = ir.getChannelData(c);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.5);
+  }
+  const rev = ACX.createConvolver(); rev.buffer = ir; rev.connect(compressor);
+  const rs = ACX.createGain(); rs.gain.value = 0.2; rs.connect(rev);
+  masterOut.connect(rs);
+
+  // Pre-build noise buffer for hammer click
+  const nlen = Math.floor(ACX.sampleRate * 0.015);
+  noiseBuf = ACX.createBuffer(1, nlen, ACX.sampleRate);
+  const nd = noiseBuf.getChannelData(0);
+  for (let i = 0; i < nlen; i++) nd[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / nlen, 3);
+}
+
+let noiseBuf = null;
+const NOTES_ALL = ['C3','C#3','D3','D#3','E3','F3','F#3','G3','G#3','A3','A#3','B3','C4','C#4','D4','D#4','E4','F4','F#4','G4','G#4','A4','A#4','B4','C5','C#5','D5','D#5','E5','F5','F#5','G5','G#5','A5','A#5','B5'];
+const FREQ = {};
+NOTES_ALL.forEach((n, i) => { FREQ[n] = 440 * Math.pow(2, (48 + i - 69) / 12); });
+
+// Optimized to only 3 harmonics per note instead of 6 with stereo detune
+const HARMONICS = [
+  {m:1, a:1.00, t:2.8}, 
+  {m:2, a:0.35, t:1.5}, 
+  {m:3, a:0.15, t:0.8}
+];
+
+function playNote(name, vel) {
+  if (!ACX) return;
+  if (ACX.state === 'suspended') ACX.resume();
+  const freq = FREQ[name];
+  if (!freq) return;
+  vel = Math.max(0.3, Math.min(1, vel));
+  const now = ACX.currentTime;
+  
+  const out = ACX.createGain(); 
+  out.gain.value = 1; 
+  out.connect(masterOut);
+
+  HARMONICS.forEach(h => {
+    const f = h.m * freq;
+    if (f > 20000) return;
+    
+    const osc = ACX.createOscillator();
+    osc.type = h.m === 1 ? 'triangle' : 'sine'; // richer fundamental
+    osc.frequency.value = f;
+    
+    const g = ACX.createGain();
+    const pk = h.a * vel * 0.15;
+    const tc = h.t * (0.5 + vel * 0.5);
+    
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(pk, now + 0.005);
+    g.gain.setTargetAtTime(1e-5, now + 0.05, tc * 0.3);
+    
+    osc.connect(g); g.connect(out);
+    osc.start(now); 
+    osc.stop(now + tc + 0.1);
+  });
+
+  if (noiseBuf) {
+    const ns = ACX.createBufferSource(); ns.buffer = noiseBuf;
+    const bpf = ACX.createBiquadFilter(); bpf.type = 'bandpass';
+    bpf.frequency.value = Math.min(freq * 2, 4000); bpf.Q.value = 1.2;
+    const cg = ACX.createGain(); cg.gain.value = vel * 0.12;
+    ns.connect(bpf); bpf.connect(cg); cg.connect(masterOut);
+    ns.start(now); 
+  }
+  
+  // Clean up references naturally, removed aggressive 9s setTimeout loop.
+}
+
+// ═══════════════════════════════
+// SCALES
+// ═══════════════════════════════
+const WHITES_ALL = ['C3','D3','E3','F3','G3','A3','B3','C4','D4','E4','F4','G4','A4','B4','C5','D5','E5','F5','G5','A5','B5'];
+const SCALE_INT = {
+  chromatic:[0,1,2,3,4,5,6,7,8,9,10,11],
+  major:[0,2,4,5,7,9,11], minor:[0,2,3,5,7,8,10],
+  blues:[0,3,5,6,7,10],   penta:[0,2,4,7,9]
+};
+let curScale = 'chromatic';
+let whites = [...WHITES_ALL];
+let activeNotes = new Set(NOTES_ALL);
+
+function setScale(s) {
+  curScale = s;
+  if (s === 'chromatic') { whites = [...WHITES_ALL]; activeNotes = new Set(NOTES_ALL); }
+  else {
+    const iv = SCALE_INT[s];
+    activeNotes = new Set(NOTES_ALL.filter(n => iv.includes(NOTES_ALL.indexOf(n) % 12)));
+    whites = WHITES_ALL.filter(n => activeNotes.has(n));
+  }
+  drawPiano();
+}
+
+function xToNote(xf) {
+  const i = Math.floor(xf * whites.length);
+  return whites[Math.max(0, Math.min(whites.length - 1, i))];
+}
+
+// ═══════════════════════════════
+// PIANO CANVAS
+// ═══════════════════════════════
+const pc = document.getElementById('pc');
+const pctx = pc.getContext('2d');
+const litSet = new Set();
+const BK = [{i:0,n:'C#'},{i:1,n:'D#'},{i:3,n:'F#'},{i:4,n:'G#'},{i:5,n:'A#'}];
+
+function resizePiano() {
+  pc.width = pc.parentElement.clientWidth;
+  pc.height = Math.max(72, Math.floor(pc.width * 0.115));
+  drawPiano();
+}
+
+function drawPiano() {
+  const W = pc.width, H = pc.height;
+  pctx.clearRect(0,0,W,H);
+  pctx.fillStyle = '#0f0f0f'; pctx.fillRect(0,0,W,H);
+  const kw = W / whites.length, bw = kw * 0.55, bh = H * 0.60;
+  whites.forEach((note, i) => {
+    const x = i * kw, lit = litSet.has(note);
+    pctx.fillStyle = lit ? '#c8c0b2' : '#f4f4f4';
+    pctx.fillRect(x+1.5, lit?4:2, kw-3, H-(lit?7:5));
+    pctx.strokeStyle = lit ? '#9a8e7e' : '#c8c8c8'; pctx.lineWidth = 0.5;
+    pctx.strokeRect(x+1.5, lit?4:2, kw-3, H-(lit?7:5));
+    pctx.fillStyle = lit ? '#6a5e4e' : '#aaa';
+    pctx.font = `500 ${Math.max(6, Math.floor(kw*0.22))}px Inter,sans-serif`;
+    pctx.textAlign = 'center';
+    pctx.fillText(note.replace(/\d/,''), x+kw/2, H-6);
+  });
+  for (let oct = 0; oct < 3; oct++) {
+    BK.forEach(b => {
+      const wi = oct*7+b.i; if (wi >= WHITES_ALL.length-1) return;
+      const nn = b.n+(3+oct);
+      if (curScale !== 'chromatic' && !activeNotes.has(nn)) return;
+      const ci = whites.indexOf(WHITES_ALL[wi]); if (ci === -1) return;
+      const x = (ci+1)*kw - bw/2, lit = litSet.has(nn);
+      pctx.fillStyle = lit ? '#555' : '#181818';
+      pctx.fillRect(x, lit?4:2, bw, bh-(lit?1:0));
+    });
+  }
+}
+
+function flashKey(name) {
+  litSet.add(name); drawPiano();
+  setTimeout(() => { litSet.delete(name); drawPiano(); }, 300);
+}
+
+pc.addEventListener('click', e => {
+  if (!ACX) return;
+  const xf = (e.clientX - pc.getBoundingClientRect().left) / pc.width;
+  fire(xToNote(xf), 0.7);
+});
+
+// ═══════════════════════════════
+// OVERLAY & TRIGGER
+// ═══════════════════════════════
+const video = document.getElementById('video');
+const ov    = document.getElementById('ov');
+const oc    = ov.getContext('2d');
+
+function syncOverlay() {
+  if (ov.width !== video.clientWidth || ov.height !== video.clientHeight) {
+    ov.width  = video.clientWidth;
+    ov.height = video.clientHeight;
+  }
+}
+
+const THRESH  = 0.60;
+const RESET_Y = 0.48;
+const fState = {};
+const TIPS = [4, 8, 12, 16, 20];
+
+let totalNotes = 0;
+const ncEl = document.getElementById('nc');
+const nbEl = document.getElementById('nb');
+
+function fire(name, vel) {
+  playNote(name, vel);
+  flashKey(name);
+  ncEl.textContent = ++totalNotes;
+  const t = document.createElement('span');
+  t.className = 'ntag'; t.textContent = name;
+  nbEl.appendChild(t);
+  setTimeout(() => t.remove(), 700);
+  if (nbEl.children.length > 8) nbEl.removeChild(nbEl.firstChild);
+}
+
+const hcEl = document.getElementById('hc');
+const fcEl = document.getElementById('fc');
+const dbg  = document.getElementById('dbg');
+const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]];
+
+function onResults(res) {
+  syncOverlay();
+  const W = ov.width, H = ov.height;
+  oc.clearRect(0, 0, W, H);
+
+  const lms = res.multiHandLandmarks;
+  const handedness = res.multiHandedness;
+  const hasHands = !!(lms && lms.length);
+  hcEl.textContent = hasHands ? lms.length : 0;
+
+  const pressYpx = H * THRESH;
+  const resetYpx = H * RESET_Y;
+
+  oc.fillStyle = 'rgba(255,190,30,0.05)';
+  oc.fillRect(0, pressYpx, W, H - pressYpx);
+
+  oc.save();
+  oc.strokeStyle = 'rgba(255,255,255,0.12)';
+  oc.lineWidth = 1; oc.setLineDash([3,8]);
+  oc.beginPath(); oc.moveTo(0, resetYpx); oc.lineTo(W, resetYpx); oc.stroke();
+  oc.restore();
+
+  oc.save();
+  oc.strokeStyle = 'rgba(255,195,30,0.7)';
+  oc.lineWidth = 2; oc.setLineDash([]);
+  oc.beginPath(); oc.moveTo(0, pressYpx); oc.lineTo(W, pressYpx); oc.stroke();
+  oc.font = 'bold 11px Inter,sans-serif';
+  oc.fillStyle = 'rgba(255,195,30,0.7)';
+  oc.textAlign = 'right';
+  oc.fillText('PRESS ↓', W - 10, pressYpx - 6);
+  oc.restore();
+
+  const seen = new Set();
+  let belowCount = 0;
+  let dbgParts = [];
+
+  if (hasHands) {
+    lms.forEach((lm, hi) => {
+      // Use handedness label (Left/Right) to ensure stable ID even if index swaps
+      const handLabel = handedness && handedness[hi] ? handedness[hi].label : `h${hi}`;
+
+      oc.save();
+      oc.strokeStyle = 'rgba(255,255,255,0.13)'; oc.lineWidth = 1.3;
+      CONN.forEach(([a,b]) => {
+        oc.beginPath();
+        oc.moveTo((1-lm[a].x)*W, lm[a].y*H);
+        oc.lineTo((1-lm[b].x)*W, lm[b].y*H);
+        oc.stroke();
+      });
+      oc.restore();
+
+      TIPS.forEach((tipId, fi) => {
+        const tip = lm[tipId];
+        const id  = `${handLabel}_${fi}`; // Stable tracking ID
+        seen.add(id);
+
+        const cy = tip.y; 
+        const cx = tip.x;
+
+        if (fState[id] === undefined) {
+          fState[id] = { prevY: cy, armed: cy < THRESH };
+        }
+        const st = fState[id];
+
+        const crossed = st.armed && st.prevY < THRESH && cy >= THRESH;
+        if (crossed) {
+          const note = xToNote(1 - cx);
+          fire(note, 0.65);
+          st.armed = false;
+        }
+
+        if (!st.armed && cy < RESET_Y) {
+          st.armed = true;
+        }
+
+        st.prevY = cy;
+
+        const dx = (1 - cx) * W;
+        const dy = cy * H;
+        const below = cy >= THRESH;
+        if (below) belowCount++;
+
+        if (st.armed) {
+          oc.beginPath(); oc.arc(dx, dy, below ? 13 : 8, 0, 6.283);
+          oc.strokeStyle = below ? 'rgba(255,195,30,0.9)' : 'rgba(255,255,255,0.2)';
+          oc.lineWidth = 1.5; oc.stroke();
+        }
+
+        oc.beginPath(); oc.arc(dx, dy, below ? 8 : 5, 0, 6.283);
+        oc.fillStyle = crossed        ? '#ffcc00'
+                     : (below && st.armed) ? 'rgba(255,195,30,0.85)'
+                     : below           ? 'rgba(255,140,30,0.5)'
+                     : st.armed        ? 'rgba(255,255,255,0.35)'
+                     :                   'rgba(255,255,255,0.15)';
+        oc.fill();
+
+        const noteName = xToNote(1 - cx);
+        const labelY = dy - 18;
+        oc.font = `${below ? '700' : '500'} ${below ? 14 : 11}px Inter,sans-serif`;
+        const tw = oc.measureText(noteName).width;
+        const pw = tw + 10, ph = below ? 20 : 16;
+        const bx = dx - pw/2, by = labelY - ph;
+
+        oc.fillStyle = below ? 'rgba(255,200,35,0.96)' : 'rgba(15,15,15,0.8)';
+        oc.fillRect(bx, by, pw, ph);
+        oc.strokeStyle = below ? 'rgba(255,255,180,0.2)' : 'rgba(255,255,255,0.07)';
+        oc.lineWidth = 0.6; oc.strokeRect(bx, by, pw, ph);
+
+        oc.beginPath(); oc.moveTo(dx, by+ph); oc.lineTo(dx, dy-5);
+        oc.strokeStyle = below ? 'rgba(255,200,35,0.5)' : 'rgba(255,255,255,0.1)';
+        oc.lineWidth = 1; oc.stroke();
+
+        oc.fillStyle = below ? '#1a1000' : 'rgba(170,170,170,0.9)';
+        oc.textAlign = 'center'; oc.textBaseline = 'middle';
+        oc.fillText(noteName, dx, by + ph/2);
+        oc.textBaseline = 'alphabetic';
+
+        dbgParts.push(`[${fi}] y=${cy.toFixed(3)} arm=${st.armed?'✓':'✗'}`);
+      });
+    });
+  }
+
+  for (const id in fState) { if (!seen.has(id)) delete fState[id]; }
+
+  fcEl.textContent = belowCount;
+  dbg.textContent  = dbgParts.length ? dbgParts.join('  ') : 'no hands detected';
+}
+
+document.querySelectorAll('#ssel .tb').forEach(b => {
+  b.addEventListener('click', () => {
+    setScale(b.dataset.s);
+    document.querySelectorAll('#ssel .tb').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+  });
+});
+
+document.getElementById('sbtn').addEventListener('click', () => {
+  bootAudio();
+  document.getElementById('splash').style.display = 'none';
+  document.getElementById('stxt').textContent = 'loading…';
+
+  const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 0,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.5
+  });
+  hands.onResults(onResults);
+
+  const cam = new Camera(video, {
+    onFrame: async () => { await hands.send({ image: video }); },
+    width: 480, height: 360
+  });
+  cam.start()
+    .then(() => {
+      document.getElementById('dot').classList.add('on');
+      document.getElementById('stxt').textContent = 'live';
+    })
+    .catch(e => {
+      document.getElementById('stxt').textContent = 'error';
+      console.error(e);
+    });
+});
+
+window.addEventListener('resize', () => { resizePiano(); syncOverlay(); });
+resizePiano();
+</script>
+</body>
+</html>
